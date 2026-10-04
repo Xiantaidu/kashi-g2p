@@ -1,0 +1,8 @@
+__pycache__/
+*.egg-info/
+.tmp-install/
+*.pt
+*.onnx
+lexicon.txz
+build/
+dist/

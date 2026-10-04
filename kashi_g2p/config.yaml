@@ -1,0 +1,72 @@
+# UniSpan-G2P-35M reference recipe. Use configs/exp23_unispan.yaml for the
+# strict production experiment.
+data:
+  - artifacts/labeled_lyrics_v3_strict_wordlevel_v2/train.jsonl
+eval_data:
+  - artifacts/labeled_lyrics_v3/dev_sample50k_kanji.jsonl
+vocab: models/bert-base-japanese-char-v3/vocab.txt
+kanjidic: resources/kanjidic2.xml.gz
+jmdict: resources/JMdict_e.gz
+unidic: resources/unidic
+ids: resources/ids.txt
+ids_format: chise_v1
+max_length: 64
+overlap: 16
+max_reading_length: 64
+# Physical micro-batch on an 8GB GPU (measured peak 1.24GB reserved).
+batch_size: 64
+grad_accum: 1
+eval_batch_size: 32
+num_workers: 2
+bucket_buffer_size: 128
+length_buckets: [16, 32, 48, 64]
+dynamic_reading_length: true
+deduplicate_readings: true
+amp_dtype: auto
+activation_checkpointing: true
+reading_chunk_size: 16
+steps: 10000
+lr: 0.0003
+weight_decay: 0.01
+grad_clip: 1.0
+eval_every: 500
+save_every: 500
+save: artifacts/experiments/v4/checkpoints/model.pt
+best_save: artifacts/experiments/v4/checkpoints/best_model.pt
+device: null
+use_haqumei: true
+use_rules: true
+use_legacy_lexicon: true
+legacy_node_cap: 512
+use_lyric_memory: false
+lyric_min_count: 2
+max_edges: 256
+max_readings_per_span: 8
+layers: 8
+dim: 512
+heads: 8
+d_ff: 1280
+edge_dim: 256
+component_dim: 256
+fusion_layers: [2, 4, 6, 8]
+fusion_heads: 8
+max_span_length: 16
+use_open_generator: true
+generator_inference: false
+generator_dim: 256
+generator_layers: 3
+generator_heads: 8
+generator_d_ff: 640
+generator_max_length: 64
+boundary_loss_weight: 0.1
+generator_loss_weight: 0.2
+warmup_steps: 500
+min_lr_ratio: 0.1
+best_metric: cer
+resource_manifest: true
+parameter_limit: 40000000
+dropout: 0.1
+reading_kernel_size: 5
+max_seq_len: 256
+source_count: 16
+seed: 42
