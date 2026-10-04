@@ -9,6 +9,13 @@ CPU.
 This repository contains the `kashi_g2p` Python package; `pip install -e .`
 exposes it as the `kashi_g2p` module.
 
+## Scope and limitations
+
+The model is trained on Japanese **lyrics** data and optimized for the lyrics
+scenario. Performance on general-domain text (news, technical prose,
+dialogue, etc.) may be considerably worse; evaluate on your own domain
+before relying on it.
+
 ## How it works
 
 1. **Span candidates** — for each input, a composite provider builds a lattice
