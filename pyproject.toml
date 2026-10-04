@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kashi-g2p"
+version = "0.1.0"
+description = "Japanese grapheme-to-phoneme (reading) estimation: dictionary/rule span candidates scored and globally decoded by a compact model; ONNX-deployable."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "kashi-g2p authors" }]
+keywords = ["japanese", "g2p", "text-processing", "furigana", "reading-estimation", "onnx"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Linguistic",
+]
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime", "numpy", "pykakasi"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["kashi_g2p"]
+
+[tool.setuptools.package-data]
+kashi_g2p = ["config.yaml"]
+
