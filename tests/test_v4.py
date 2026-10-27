@@ -824,20 +824,20 @@ def test_derive_okurigana_stems():
 def test_rendaku_trap_filter():
     from kashi_g2p.candidates import CompositeProvider
     from kashi_g2p.model_types import Edge
-    # Former hardcoded cases still handled by the general voicing rule.
-    e_archaic = Edge(0, 3, "大丈夫", "だいじょうふ", "jmdict")
-    e_modern = Edge(0, 3, "大丈夫", "だいじょうぶ", "pyopenjtalk")
-    readings = [e.reading for e in
-                CompositeProvider._filter_rendaku_traps([e_archaic, e_modern])]
-    assert "だいじょうふ" not in readings
-    assert "だいじょうぶ" in readings
+    e_archaic = Edge(0, 3, "大丈夫", "だいじょうふ", "jmdict", prior=0.8)
+    e_modern = Edge(0, 3, "大丈夫", "だいじょうぶ", "pyopenjtalk", prior=0.8)
+    result = CompositeProvider._filter_rendaku_traps([e_archaic, e_modern])
+    readings = [e.reading for e in result]
+    assert "だいじょうふ" in readings and "だいじょうぶ" in readings
+    assert next(e for e in result
+                if e.reading == "だいじょうふ").prior == pytest.approx(0.6)
 
-    # Generalizes to any word not in any table (medial こ→ご voicing).
-    e_unvoiced = Edge(0, 2, "山川", "やまかわ", "jmdict")
-    e_voiced = Edge(0, 2, "山川", "やまがわ", "unidic")
-    readings = [e.reading for e in
-                CompositeProvider._filter_rendaku_traps([e_unvoiced, e_voiced])]
-    assert "やまかわ" not in readings and "やまがわ" in readings
+    e_unvoiced = Edge(0, 2, "山川", "やまかわ", "jmdict", prior=0.8)
+    e_voiced = Edge(0, 2, "山川", "やまがわ", "unidic", prior=0.8)
+    result = CompositeProvider._filter_rendaku_traps([e_unvoiced, e_voiced])
+    assert {e.reading for e in result} == {"やまかわ", "やまがわ"}
+    assert next(e for e in result
+                if e.reading == "やまかわ").prior == pytest.approx(0.6)
 
     # Does NOT fire on initial-mora voicing (that is _expand_word_variants'
     # job; suppressing it here would drop legitimate non-rendaku readings).
@@ -851,6 +851,29 @@ def test_rendaku_trap_filter():
     solo = Edge(0, 2, "水川", "みずかわ", "jmdict")
     readings = [e.reading for e in CompositeProvider._filter_rendaku_traps([solo])]
     assert readings == ["みずかわ"]
+
+
+def test_candidate_graph_respects_total_edge_cap():
+    from kashi_g2p.candidates import CompositeProvider
+    from kashi_g2p.model_types import Edge
+
+    class Flood:
+        def build(self, text):
+            edges = []
+            for index, char in enumerate(text):
+                edges.append(Edge(index, index + 1, char, char, "copy",
+                                  prior=-1.0))
+                for k in range(5):
+                    edges.append(Edge(index, index + 1, char, f"r{k}",
+                                      "jmdict", prior=0.5))
+            return edges
+
+    text = "あ" * 70
+    provider = CompositeProvider([Flood()], total_edge_cap=256,
+                                 per_span_reading_cap=16)
+    edges = provider.build(text)
+    assert len(edges) <= 256
+    assert sum(edge.source == "copy" for edge in edges) == len(text)
 
 
 def test_first_order_viterbi_matches_zero_order_when_transition_zero():

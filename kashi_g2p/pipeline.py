@@ -32,6 +32,21 @@ def _model_class(config: Mapping[str, Any]):
     return SpanG2P
 
 
+def _contained_edges(edges: Sequence[Any], spans: Sequence[tuple[int, int]],
+                     length: int) -> list[Any]:
+    """Drop edges that cross a fixed-word boundary."""
+    segment_end = [0] * length
+    for start, end in spans:
+        start = max(0, int(start))
+        end = min(length, int(end))
+        for position in range(start, end):
+            segment_end[position] = end
+    return [edge for edge in edges
+            if 0 <= edge.start < length
+            and segment_end[edge.start] > 0
+            and edge.end <= segment_end[edge.start]]
+
+
 def _candidate_api():
     """Load the evolving candidate API at use time and fail actionably."""
     try:
@@ -373,7 +388,10 @@ class V4Pipeline:
                  max_reading_length: int = 64, max_length: int | None = None,
                  config: Mapping[str, Any] | None = None,
                  checkpoint_meta: Mapping[str, Any] | None = None,
-                 input_feature_builder: Any | None = None):
+                 input_feature_builder: Any | None = None,
+                 segmenter: Any | None = None,
+                 segmentation: Any | None = None,
+                 unidic_dir: str | Path | None = None):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         self.provider = provider
@@ -389,6 +407,12 @@ class V4Pipeline:
         configured = int(max_length or self.config.get("max_length", 0) or 0)
         rope_limit = self._model_sequence_limit()
         self.max_length = min(value for value in (configured, rope_limit) if value > 0)
+        # None/"free" keeps free Viterbi; anything else names a segmenter.
+        self.unidic_dir = str(unidic_dir) if unidic_dir else None
+        self.segmentation_spec = segmentation
+        self._segmenters: dict[str, Any] = {}
+        if segmenter is not None:
+            self._segmenters[str(getattr(segmenter, "name", "custom"))] = segmenter
 
     def _model_sequence_limit(self) -> int:
         blocks = getattr(self.model, "blocks", ())
@@ -413,6 +437,7 @@ class V4Pipeline:
                         use_legacy_lexicon_only: bool = False,
                         lyric_train: str | Path | Sequence[str | Path] | None = None,
                         strict_resources: bool = True,
+                        segmentation: Any | None = None,
                         provider: Any | None = None, **provider_overrides) -> "V4Pipeline":
         checkpoint_path = Path(checkpoint).expanduser().resolve()
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -495,11 +520,14 @@ class V4Pipeline:
         model = _load_model(model_state, config, vocab=vocab)
         target_device = device or config.get("device") or (
             "cuda" if torch.cuda.is_available() else "cpu")
+        spec = (segmentation if segmentation is not None
+                else config.get("inference_segmentation"))
         return cls(model, provider, vocab, device=target_device, config=config,
                    max_reading_length=int(config.get("max_reading_length", 64)),
                    max_length=int(config.get("max_length", 0) or 0) or None,
                    checkpoint_meta=payload,
-                   input_feature_builder=feature_builder)
+                   input_feature_builder=feature_builder,
+                   segmentation=spec, unidic_dir=selected["unidic"])
 
     @classmethod
     def from_resources(cls, *, vocab_path: str | Path,
@@ -508,6 +536,7 @@ class V4Pipeline:
                        unidic_dir: str | Path | None = None,
                        lyric_train: str | Path | None = None,
                        device: torch.device | str = "cpu",
+                       segmentation: Any | None = None,
                        model: SpanG2P | None = None, **options) -> "V4Pipeline":
         """Explicit untrained-model constructor retained for tests and research."""
         candidates = _candidate_api()
@@ -528,7 +557,8 @@ class V4Pipeline:
         }
         return cls(model or SpanG2P(vocab_size=max(vocab.values()) + 1), provider,
                    vocab, device=device, config=config,
-                   max_reading_length=max_reading_length)
+                   max_reading_length=max_reading_length,
+                   segmentation=segmentation, unidic_dir=unidic_dir)
 
     def _build_edges(self, text: str) -> list[Any]:
         edges = list(self.provider.build(text))
@@ -657,6 +687,98 @@ class V4Pipeline:
         return {"text": text, "reading": path.reading, "edges": selected,
                 "score": path.score, "confidence": confidence}
 
+    def _resolve_segmenter(self, spec: Any):
+        """Resolve a segmentation spec, caching the external tokenizer."""
+        from . import segmentation as segmentation_api
+
+        if spec is None or (isinstance(spec, str)
+                            and spec.strip().lower() in ("", "none", "free")):
+            return None
+        if isinstance(spec, str) and spec in self._segmenters:
+            return self._segmenters[spec]
+        segmenter = segmentation_api.resolve_segmenter(
+            spec, default_unidic_dir=self.unidic_dir)
+        if segmenter is not None:
+            self._segmenters[str(getattr(segmenter, "name", spec))] = segmenter
+        return segmenter
+
+    def _decode_fixed(self, text: str, edges: list[Any], scores: Tensor,
+                      segments: Sequence[tuple[int, int]], *,
+                      force_locked: bool,
+                      compute_posterior: bool = True,
+                      transition_scores: Tensor | None = None,
+                      source: str = "fixed") -> dict[str, Any]:
+        """Decode with boundaries frozen to ``segments``."""
+        decoder = _decoder_api()
+        path = decoder.decode_fixed_segments(
+            scores, edges, len(text), segments, force_locked=force_locked,
+            transition_scores=transition_scores)
+        # Posterior only feeds per-edge confidence; it never moves boundaries.
+        posterior = (_edge_posteriors(scores, edges, len(text), force_locked,
+                                      transition_scores=transition_scores)
+                     if compute_posterior else None)
+        selected = []
+        unit_records = []
+        for unit in path.units:
+            for index in unit.edge_indices:
+                edge = edges[index]
+                confidence = (float(posterior[index].detach().cpu())
+                              if posterior is not None else 1.0)
+                selected.append({
+                    "start": edge.start, "end": edge.end,
+                    "surface": edge.surface, "reading": edge.reading,
+                    "source": edge.source, "locked": edge.locked,
+                    "score": float(scores[index].detach().cpu()),
+                    "confidence": confidence,
+                })
+            unit_records.append({
+                "start": unit.start, "end": unit.end, "surface": unit.surface,
+                "reading": unit.reading, "mode": unit.mode,
+                "score": float(unit.score),
+            })
+        confidence = min((edge["confidence"] for edge in selected), default=1.0)
+        return {"text": text, "reading": path.reading, "edges": selected,
+                "score": path.score, "confidence": confidence,
+                "mode": "fixed",
+                "segmentation": {"source": source, "segments": unit_records}}
+
+    def _fixed_windows(self, segments: Sequence[Any], length: int
+                       ) -> list[tuple[int, int, list[Any]]]:
+        """Group fixed segments into model windows without moving boundaries.
+
+        Only a segment longer than the model limit is split, at a fixed stride.
+        """
+        from .segmentation import Segment
+
+        limit = self.max_length
+        pieces: list[Any] = []
+        for segment in segments:
+            start = int(segment.start)
+            end = int(segment.end)
+            surface = segment.surface
+            while end - start > limit:
+                pieces.append(Segment(start, start + limit,
+                                      surface[start - segment.start:
+                                              start - segment.start + limit]))
+                start += limit
+            pieces.append(Segment(start, end,
+                                  surface[start - segment.start:
+                                          end - segment.start]))
+        windows: list[tuple[int, int, list[Any]]] = []
+        group: list[Any] = []
+        for piece in pieces:
+            if group and piece.end - group[0].start > limit:
+                windows.append((group[0].start, group[-1].end, group))
+                group = []
+            group.append(piece)
+        if group:
+            windows.append((group[0].start, group[-1].end, group))
+        covered = windows[-1][1] if windows else 0
+        if covered != length:
+            raise ValueError(
+                f"fixed segmentation covers [0, {covered}) but text length is {length}")
+        return windows
+
     def _safe_windows(self, text: str, edges: list[Any]) -> list[tuple[int, int]]:
         """Choose deterministic boundaries that never bisect a provider edge."""
         if len(text) <= self.max_length:
@@ -709,10 +831,41 @@ class V4Pipeline:
     @torch.inference_mode(False)
     def predict_batch(self, texts: Sequence[str], *, force_locked: bool = True,
                       allow_windows: bool = True,
-                      compute_posterior: bool = True) -> list[dict[str, Any]]:
+                      compute_posterior: bool = True,
+                      segmentation: Any | None = None,
+                      segments: Sequence[Sequence[Any] | None] | None = None
+                      ) -> list[dict[str, Any]]:
+        """Predict readings for a batch.
+
+        A segmenter name (or ``segments``) fixes word boundaries; ``"free"``
+        keeps joint Viterbi and ``None`` uses the pipeline default.
+        """
         normalized = [normalize_surface(str(text)) for text in texts]
         if any(not text for text in normalized):
             raise ValueError("empty input text is not supported")
+        if segments is not None:
+            if len(segments) != len(normalized):
+                raise ValueError(
+                    "segments must provide one entry per input text")
+            if any(entry is None for entry in segments):
+                raise ValueError("segments must provide an entry for every text")
+            from .segmentation import segments_from_argument
+
+            fixed = [segments_from_argument(text, entry)
+                     for text, entry in zip(normalized, segments)]
+            return self._predict_with_segments(
+                normalized, fixed, source="fixed",
+                force_locked=force_locked, allow_windows=allow_windows,
+                compute_posterior=compute_posterior)
+        spec = self.segmentation_spec if segmentation is None else segmentation
+        segmenter = self._resolve_segmenter(spec)
+        if segmenter is not None:
+            fixed = [segmenter.segment(text) for text in normalized]
+            return self._predict_with_segments(
+                normalized, fixed, source=str(segmenter.name),
+                force_locked=force_locked, allow_windows=allow_windows,
+                compute_posterior=compute_posterior)
+
         results: list[dict[str, Any] | None] = [None] * len(normalized)
         direct_indices = [index for index, text in enumerate(normalized)
                           if len(text) <= self.max_length]
@@ -740,20 +893,145 @@ class V4Pipeline:
                                                 compute_posterior=compute_posterior)
         return [result for result in results if result is not None]
 
+    def _predict_with_segments(self, texts: Sequence[str],
+                               segmentations: Sequence[Sequence[Any]], *,
+                               source: str, force_locked: bool,
+                               allow_windows: bool,
+                               compute_posterior: bool
+                               ) -> list[dict[str, Any]]:
+        """Run fixed-boundary decoding for already-segmented texts."""
+        results: list[dict[str, Any] | None] = [None] * len(texts)
+        direct_indices = [index for index, text in enumerate(texts)
+                          if len(text) <= self.max_length]
+        if direct_indices:
+            direct_texts = [texts[index] for index in direct_indices]
+            direct_edges = [
+                _contained_edges(
+                    self._build_edges(text),
+                    [(segment.start, segment.end)
+                     for segment in segmentations[index]],
+                    len(text))
+                for index, text in zip(direct_indices, direct_texts)]
+            with torch.inference_mode():
+                batch, output = self._forward(direct_texts, direct_edges)
+            trans_scores = getattr(output, "transition_scores", None)
+            for row, original_index in enumerate(direct_indices):
+                spans = [(segment.start, segment.end)
+                         for segment in segmentations[original_index]]
+                row_trans = trans_scores[row] if trans_scores is not None else None
+                results[original_index] = self._decode_fixed(
+                    batch.texts[row], batch.edges[row],
+                    output.edge_scores[row, :len(batch.edges[row])],
+                    spans, force_locked=force_locked,
+                    compute_posterior=compute_posterior,
+                    transition_scores=row_trans, source=source)
+        for index, text in enumerate(texts):
+            if results[index] is not None:
+                continue
+            if not allow_windows:
+                raise ValueError(
+                    f"input length {len(text)} exceeds model limit {self.max_length}")
+            results[index] = self._predict_long_fixed(
+                text, segmentations[index], source=source,
+                force_locked=force_locked,
+                compute_posterior=compute_posterior)
+        return [result for result in results if result is not None]
+
+    def _predict_long_fixed(self, text: str, segments: Sequence[Any], *,
+                            source: str, force_locked: bool,
+                            compute_posterior: bool) -> dict[str, Any]:
+        windows = self._fixed_windows(segments, len(text))
+        local_texts = [text[start:end] for start, end, _group in windows]
+        local_edges = []
+        for (start, _end, group), local in zip(windows, local_texts):
+            spans = [(segment.start - start, segment.end - start)
+                     for segment in group]
+            local_edges.append(
+                _contained_edges(self._build_edges(local), spans, len(local)))
+        with torch.inference_mode():
+            batch, output = self._forward(local_texts, local_edges)
+        trans_scores = getattr(output, "transition_scores", None)
+        readings = []
+        stitched_edges = []
+        stitched_units = []
+        score = 0.0
+        confidence = 1.0
+        for row, (start, _end, group) in enumerate(windows):
+            spans = [(segment.start - start, segment.end - start)
+                     for segment in group]
+            decoded = self._decode_fixed(
+                batch.texts[row], batch.edges[row],
+                output.edge_scores[row, :len(batch.edges[row])],
+                spans, force_locked=force_locked,
+                compute_posterior=compute_posterior,
+                transition_scores=(trans_scores[row]
+                                   if trans_scores is not None else None),
+                source=source)
+            readings.append(decoded["reading"])
+            score += float(decoded["score"])
+            confidence = min(confidence, float(decoded["confidence"]))
+            for edge in decoded["edges"]:
+                shifted = dict(edge)
+                shifted["start"] += start
+                shifted["end"] += start
+                stitched_edges.append(shifted)
+            for unit in decoded["segmentation"]["segments"]:
+                shifted = dict(unit)
+                shifted["start"] += start
+                shifted["end"] += start
+                stitched_units.append(shifted)
+        return {"text": text, "reading": "".join(readings),
+                "edges": stitched_edges, "score": score,
+                "confidence": confidence, "mode": "fixed",
+                "segmentation": {"source": source, "segments": stitched_units}}
+
     def predict(self, text: str, *, force_locked: bool = True,
                 allow_windows: bool = True,
-                compute_posterior: bool = True) -> dict[str, Any]:
-        return self.predict_batch([text], force_locked=force_locked,
-                                  allow_windows=allow_windows,
-                                  compute_posterior=compute_posterior)[0]
+                compute_posterior: bool = True,
+                segmentation: Any | None = None,
+                segments: Sequence[Any] | None = None) -> dict[str, Any]:
+        return self.predict_batch(
+            [text], force_locked=force_locked, allow_windows=allow_windows,
+            compute_posterior=compute_posterior, segmentation=segmentation,
+            segments=None if segments is None else [segments])[0]
+
+    def predict_segmented(self, text: str, *, segments: Sequence[Any] | None = None,
+                          segmentation: Any | None = None,
+                          force_locked: bool = True,
+                          allow_windows: bool = True,
+                          compute_posterior: bool = True) -> dict[str, Any]:
+        """Predict with fixed word boundaries, returning per-segment readings.
+
+        Requires either explicit ``segments``, a ``segmentation`` spec, or an
+        ``inference_segmentation`` default on the pipeline.
+        """
+        if (segments is None and segmentation is None
+                and self.segmentation_spec is None):
+            raise ValueError(
+                "predict_segmented needs segments=, segmentation=, or an "
+                "inference_segmentation pipeline default")
+        return self.predict(
+            text, force_locked=force_locked, allow_windows=allow_windows,
+            compute_posterior=compute_posterior,
+            segmentation=segmentation, segments=segments)
 
     def _predict_long(self, text: str, *, force_locked: bool,
                       compute_posterior: bool = True) -> dict[str, Any]:
-        global_edges = self._build_edges(text)
-        windows = self._safe_windows(text, global_edges)
+        # Tokenizer windows avoid a global graph being pruned to copy edges,
+        # which would split words and starve readings.
+        windows: list[tuple[int, int]] | None = None
+        if self.unidic_dir:
+            segmenter = self._resolve_segmenter("unidic")
+            if segmenter is not None:
+                segments = segmenter.segment(text)
+                windows = [(start, end)
+                           for start, end, _group in self._fixed_windows(
+                               segments, len(text))]
+        if windows is None:
+            global_edges = self._build_edges(text)
+            windows = self._safe_windows(text, global_edges)
         local_texts = [text[start:end] for start, end in windows]
-        local_edges = [self._local_edges(text, global_edges, start, end)
-                       for start, end in windows]
+        local_edges = [self._build_edges(local) for local in local_texts]
         with torch.inference_mode():
             batch, output = self._forward(local_texts, local_edges)
         stitched_edges = []

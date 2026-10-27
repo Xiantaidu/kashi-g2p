@@ -32,6 +32,40 @@ class DecodedPath:
         return "".join(edge.reading for edge in self.edges)
 
 
+@dataclass(frozen=True)
+class SegmentedUnit:
+    """One fixed segment and the reading chosen for it.
+
+    ``mode`` is ``"span"`` for an exact covering candidate, ``"decomposed"``
+    otherwise.
+    """
+
+    start: int
+    end: int
+    surface: str
+    reading: str
+    edge_indices: list[int]
+    score: float
+    mode: str
+
+
+@dataclass(frozen=True)
+class FixedSegmentedPath:
+    """A decoded path whose word boundaries come from an external tokenizer."""
+
+    units: list[SegmentedUnit]
+    edges: list[Edge]
+    score: float
+
+    @property
+    def reading(self) -> str:
+        return "".join(unit.reading for unit in self.units)
+
+    @property
+    def edge_indices(self) -> list[int]:
+        return [index for unit in self.units for index in unit.edge_indices]
+
+
 def _forced_edges(edges: list[Edge], length: int) -> set[int]:
     """Select locked spans and reject overlapping alternatives."""
     locked = [(index, edge) for index, edge in enumerate(edges) if edge.locked]
@@ -125,25 +159,11 @@ def _morpho_penalty(prev: Edge, curr: Edge) -> float:
     return 0.0
 
 
-def decode_viterbi(scores: Tensor, edges: list[Edge], length: int,
-                   *, force_locked: bool = True,
-                   transition_scores: Tensor | None = None) -> DecodedPath:
-    """Return the highest-scoring non-overlapping path covering ``[0, length)``.
-
-    Supports both 0th-order semi-Markov DP (when ``transition_scores`` is None)
-    and exact 1st-order semi-Markov DP (when pairwise transition scores are provided).
-    """
-    if scores.ndim != 1 or scores.numel() != len(edges):
-        raise ValueError("scores must have one value for each edge")
-    allowed = (_allowed_edges(edges, length) if force_locked
-               else set(range(len(edges))))
-    values = scores.detach().float().cpu().tolist()
-    if transition_scores is not None:
-        trans_vals = transition_scores.detach().float().cpu().tolist()
-    else:
-        trans_vals = None
-
-    # Exact semi-Markov DP with morphosyntactic transition gating
+def _viterbi_core(values: list[float], edges: list[Edge], allowed: set[int],
+                  length: int,
+                  trans_vals: list[list[float]] | None = None
+                  ) -> tuple[list[int], float]:
+    """Exact semi-Markov DP with morphosyntactic transition gating."""
     num_edges = len(edges)
     v_edge = [-math.inf] * num_edges
     back_edge = [-1] * num_edges
@@ -196,7 +216,95 @@ def decode_viterbi(scores: Tensor, edges: list[Edge], length: int,
         indices_out.append(cursor_edge)
         cursor_edge = back_edge[cursor_edge]
     indices_out.reverse()
+    return indices_out, best_total
+
+
+def decode_viterbi(scores: Tensor, edges: list[Edge], length: int,
+                   *, force_locked: bool = True,
+                   transition_scores: Tensor | None = None) -> DecodedPath:
+    """Return the highest-scoring path covering ``[0, length)``.
+
+    ``transition_scores`` switches between 0th- and 1st-order semi-Markov DP.
+    """
+    if scores.ndim != 1 or scores.numel() != len(edges):
+        raise ValueError("scores must have one value for each edge")
+    allowed = (_allowed_edges(edges, length) if force_locked
+               else set(range(len(edges))))
+    values = scores.detach().float().cpu().tolist()
+    trans_vals = (transition_scores.detach().float().cpu().tolist()
+                  if transition_scores is not None else None)
+    indices_out, best_total = _viterbi_core(values, edges, allowed, length,
+                                            trans_vals)
     return DecodedPath(indices_out, [edges[index] for index in indices_out], best_total)
+
+
+def decode_fixed_segments(scores: Tensor, edges: list[Edge], length: int,
+                          segments: Sequence[tuple[int, int]], *,
+                          force_locked: bool = True,
+                          transition_scores: Tensor | None = None
+                          ) -> FixedSegmentedPath:
+    """Decode readings without moving the supplied word boundaries.
+
+    One global DP runs over candidates contained in each segment, so only the
+    path composition is constrained; locked spans still win over model scores.
+    """
+    if scores.ndim != 1 or scores.numel() != len(edges):
+        raise ValueError("scores must have one value for each edge")
+    spans = [(int(start), int(end)) for start, end in segments]
+    cursor = 0
+    for start, end in spans:
+        if start != cursor:
+            raise ValueError(
+                "fixed segments must be contiguous and non-overlapping; "
+                f"expected offset {cursor}, got {(start, end)}")
+        if not 0 <= start < end <= length:
+            raise ValueError(f"fixed segment {(start, end)} is outside [0, {length})")
+        cursor = end
+    if cursor != length:
+        raise ValueError(
+            f"fixed segments cover [0, {cursor}) but text length is {length}")
+
+    values = scores.detach().float().cpu().tolist()
+    trans_vals = (transition_scores.detach().float().cpu().tolist()
+                  if transition_scores is not None else None)
+
+    contained: list[int] = []
+    for index, edge in enumerate(edges):
+        if any(start <= edge.start and edge.end <= end for start, end in spans):
+            contained.append(index)
+    if not contained:
+        raise ValueError("no candidate edge is contained in the fixed segments")
+
+    local_edges = [edges[index] for index in contained]
+    local_values = [values[index] for index in contained]
+    local_trans = ([[trans_vals[outer][inner] for inner in contained]
+                    for outer in contained]
+                   if trans_vals is not None else None)
+    allowed = (_allowed_edges(local_edges, length) if force_locked
+               else set(range(len(local_edges))))
+    local_indices, total = _viterbi_core(
+        local_values, local_edges, allowed, length, local_trans)
+    chosen = [contained[index] for index in local_indices]
+
+    units: list[SegmentedUnit] = []
+    chosen_edges: list[Edge] = []
+    for start, end in spans:
+        indices = [index for index in chosen
+                   if start <= edges[index].start and edges[index].end <= end]
+        if not indices:
+            raise ValueError(
+                f"no decoded edge covers fixed segment {(start, end)}")
+        single_span = (len(indices) == 1
+                       and edges[indices[0]].start == start
+                       and edges[indices[0]].end == end)
+        unit_score = sum(values[index] for index in indices)
+        units.append(SegmentedUnit(
+            start, end, "".join(edges[index].surface for index in indices),
+            "".join(edges[index].reading for index in indices),
+            indices, unit_score, "span" if single_span else "decomposed"))
+        chosen_edges.extend(edges[index] for index in indices)
+
+    return FixedSegmentedPath(units, chosen_edges, total)
 
 
 def _check_batched_inputs(scores: Tensor, starts: Tensor, ends: Tensor,

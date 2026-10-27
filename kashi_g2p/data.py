@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -390,6 +390,37 @@ def _safe_token_ids(text: str, vocab: dict[str, int]) -> list[int]:
     return [int(vocab.get(char, unknown)) for char in text]
 
 
+_SEGMENTATION_FALLBACKS = [0]
+
+
+def _segment_contained_edges(edges: Sequence[Edge], segmenter,
+                             text: str) -> list[int] | None:
+    """Indices of edges fully inside one fixed segment; None to skip filtering."""
+    try:
+        spans = [(int(segment.start), int(segment.end))
+                 for segment in segmenter.segment(text)]
+    except Exception as exc:  # noqa: BLE001 - misaligned tokenizer output
+        _SEGMENTATION_FALLBACKS[0] += 1
+        if _SEGMENTATION_FALLBACKS[0] % 500 == 1:
+            print(json.dumps({
+                "event": "segmentation_fallback",
+                "occurrences": _SEGMENTATION_FALLBACKS[0],
+                "error": f"{type(exc).__name__}: {exc}"[:200],
+            }, ensure_ascii=False), flush=True)
+        return None
+    segment_end = [0] * len(text)
+    for start, end in spans:
+        for position in range(max(0, start), min(len(text), end)):
+            segment_end[position] = end
+    kept: list[int] = []
+    for index, edge in enumerate(edges):
+        if (0 <= edge.start < len(text)
+                and edge.end <= segment_end[edge.start]
+                and segment_end[edge.start] > 0):
+            kept.append(index)
+    return kept
+
+
 @dataclass
 class SparseEdgeCollator:
     provider: CandidateProvider
@@ -405,6 +436,8 @@ class SparseEdgeCollator:
     max_span_length: int = 16
     generator_supervision: bool = True
     coarsen_segmentation: bool = True
+    # Optional fixed-word segmenter; edges must stay inside one segment.
+    segmentation: Any | None = None
     # Contrast ablation opt-in. "all" (default) leaves the collator output
     # byte-identical to the pre-experiment behavior: no trusted mask is built.
     # "hard" additionally computes trusted_gold_span_mask per batch so the
@@ -459,6 +492,12 @@ class SparseEdgeCollator:
             edges, compatible = build_gold_edges(
                 row, self.provider.build(text), inject_missing=should_inject,
                 coarsen_segmentation=self.coarsen_segmentation)
+            if self.segmentation is not None:
+                kept = _segment_contained_edges(
+                    edges, self.segmentation, text)
+                if kept is not None:
+                    compatible = [compatible[i] for i in kept]
+                    edges = [edges[i] for i in kept]
             all_edges.append(edges)
             all_masks.append(compatible)
             specials_by_row.append(_special_spans(row, len(text)))

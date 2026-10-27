@@ -193,31 +193,47 @@ class WindowedJsonlDataset(IterableDataset):
                             continue
                         seen.add((start, end))
                         sliced = {}
+                        cut_spans: list[tuple[int, int]] = []
                         for key, value in row.items():
                             if key == "file_path":
                                 continue
                             if key == "text":
                                 sliced[key] = value[start:end]
                             elif key == "special_spans":
-                                # Keep span coordinates local to this
-                                # window.  A boundary-cut span is clipped;
-                                # the explicit template still emits its
-                                # reading once within the visible region.
+                                # A span cut by the window boundary is dropped;
+                                # its fragment must not carry the full reading.
                                 spans = []
                                 for span in value or []:
                                     span_start = int(span.get("start", 0))
                                     span_end = int(span.get("end", span_start))
                                     if span_start >= end or span_end <= start:
                                         continue
-                                    clipped = dict(span)
-                                    clipped["start"] = max(span_start, start) - start
-                                    clipped["end"] = min(span_end, end) - start
-                                    spans.append(clipped)
+                                    if start <= span_start and span_end <= end:
+                                        clipped = dict(span)
+                                        clipped["start"] = span_start - start
+                                        clipped["end"] = span_end - start
+                                        spans.append(clipped)
+                                    else:
+                                        cut_spans.append((
+                                            max(span_start, start) - start,
+                                            min(span_end, end) - start))
                                 sliced[key] = spans
                             elif isinstance(value, list):
                                 sliced[key] = value[start:end]
                             else:
                                 sliced[key] = value
+                        for local_start, local_end in cut_spans:
+                            loss_mask = sliced.get("loss_mask")
+                            if isinstance(loss_mask, list):
+                                for position in range(local_start,
+                                                      min(local_end,
+                                                          len(loss_mask))):
+                                    loss_mask[position] = 0
+                            row_b = sliced.get("B")
+                            if (isinstance(row_b, list)
+                                    and local_start < len(row_b)
+                                    and row_b[local_start] != "COPY"):
+                                row_b[local_start] = "COPY"
                         if self.require_kanji and not is_trainable_kanji_text(
                                 sliced["text"],
                                 has_explicit_reading=bool(sliced.get("special_spans"))):

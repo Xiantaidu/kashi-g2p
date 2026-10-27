@@ -12,6 +12,7 @@ import math
 import re
 import unicodedata
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -953,7 +954,18 @@ class CompositeProvider:
         result = self._filter_rendaku_traps(result)
         result = self._repair_complete_path(result, text)
         result = self._derive_okurigana_stems(result, text)
+        result = self._enforce_edge_cap(result)
         return sorted(result, key=self._output_key)
+
+    def _enforce_edge_cap(self, edges: list[Edge]) -> list[Edge]:
+        """Final hard cap after additive stem derivation."""
+        cap = self.total_edge_cap
+        if cap is None or len(edges) <= cap:
+            return edges
+        copies = [edge for edge in edges if edge.source == "copy"]
+        others = [edge for edge in edges if edge.source != "copy"]
+        budget = max(0, cap - len(copies))
+        return copies + sorted(others, key=self._prune_key)[:budget]
 
     @staticmethod
     def _filter_truncated_okurigana(edges: list[Edge], text: str) -> list[Edge]:
@@ -1033,43 +1045,32 @@ class CompositeProvider:
 
     @classmethod
     def _filter_rendaku_traps(cls, edges: list[Edge]) -> list[Edge]:
-        """Suppress an unvoiced reading when a rendaku-voiced sibling exists.
+        """Keep unvoiced rendaku siblings, down-weighted rather than deleted.
 
-        General 連濁 rule (no per-word table): within one span, if a dictionary
-        word reading differs from another dictionary word reading of the same
-        span by voicing exactly one *non-initial* mora (per the ``_DAKUTEN`` /
-        ``_HANDAKU`` phonology maps), the unvoiced form is a compound-medial
-        rendaku trap and is dropped in favour of the voiced form.  This
-        generalizes the former archaic-trap word list (だいじょうふ→ぶ, てんこく→ご
-        are exactly this pattern) to every word without enumerating any.
-
-        Only non-initial positions (k >= 1) are considered, so this never
-        collides with the first-mora variants synthesized by
-        ``_expand_word_variants``.  Locked (deterministic/copy) edges are never
-        dropped.
+        Only non-initial positions are considered; locked edges are untouched.
         """
-        by_span: dict[tuple[int, int], list[Edge]] = defaultdict(list)
-        for edge in edges:
-            by_span[(edge.start, edge.end)].append(edge)
+        by_span: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for index, edge in enumerate(edges):
+            by_span[(edge.start, edge.end)].append(index)
 
-        drop: set[int] = set()
-        for span_edges in by_span.values():
-            readings = {edge.reading for edge in span_edges
-                        if edge.source in cls._WORD_SOURCES}
+        result = list(edges)
+        for indices in by_span.values():
+            readings = {edges[i].reading for i in indices
+                        if edges[i].source in cls._WORD_SOURCES}
             if len(readings) < 2:
                 continue
-            for edge in span_edges:
+            for i in indices:
+                edge = edges[i]
                 if edge.source not in cls._WORD_SOURCES or edge.locked:
                     continue
                 reading = edge.reading
                 for k in range(1, len(reading)):
                     voiced = cls._DAKUTEN.get(reading[k]) or cls._HANDAKU.get(reading[k])
                     if voiced and reading[:k] + voiced + reading[k + 1:] in readings:
-                        drop.add(id(edge))
+                        result[i] = replace(
+                            edge, prior=max(0.0, edge.prior - 0.2))
                         break
-        if not drop:
-            return edges
-        return [edge for edge in edges if id(edge) not in drop]
+        return result
 
     @staticmethod
     def _copy_edges(text: str) -> list[Edge]:
@@ -1177,7 +1178,8 @@ class CompositeProvider:
                       if (edge.start, edge.end, edge.reading,
                           edge.source) in mandatory]
             others = [edge for edge in keep if edge not in copies]
-            keep = copies + sorted(others, key=self._prune_key)[:self.total_edge_cap]
+            budget = max(0, self.total_edge_cap - len(copies))
+            keep = copies + sorted(others, key=self._prune_key)[:budget]
         copy_keys = {
             (edge.start, edge.end, edge.reading, edge.source)
             for edge in keep if edge.source == "copy"

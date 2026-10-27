@@ -12,6 +12,7 @@ from .alignment import align_ruby
 from .kanjidic import Kanjidic
 from .normalization import contains_kanji, hira, is_kanji, is_trainable_kanji_text
 from .rules import apply_variation
+from .segmentation import make_tagger
 
 try:
     from tqdm.auto import tqdm
@@ -112,9 +113,7 @@ def _unidic_tokenizer(unidic: str, reading_field: str = "kana") -> Tokenizer:
     labels, which come from human ruby.  ``pron`` is the phonetic realization
     (トーキョー); scoring it against ruby gold penalizes every long vowel.
     """
-    import fugashi
-
-    tagger = fugashi.Tagger(f'-r nul -d "{unidic}"')
+    tagger = make_tagger(unidic)
     base_field = {"kana": "kanaBase", "pron": "pronBase"}[reading_field]
 
     def tokenize(text: str) -> list[_Token]:

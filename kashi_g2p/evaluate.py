@@ -240,7 +240,8 @@ def _load_exempt(path: str | Path | None) -> dict[int, set[int]]:
 def evaluate_rows(pipeline: V4Pipeline, rows: Iterable[dict[str, Any]], *,
                   batch_size: int = 16, limit: int | None = None,
                   fast: bool = False,
-                  exempt: dict[int, set[int]] | None = None) -> dict[str, Any]:
+                  exempt: dict[int, set[int]] | None = None,
+                  segmentation: Any | None = None) -> dict[str, Any]:
     totals: Counter[str] = Counter()
     bucket_errors: Counter[str] = Counter()
     bucket_errors_folded: Counter[str] = Counter()
@@ -250,7 +251,8 @@ def evaluate_rows(pipeline: V4Pipeline, rows: Iterable[dict[str, Any]], *,
 
     def consume(chunk: list[dict[str, Any]]) -> None:
         texts = [normalize_surface(str(row.get("text", ""))) for row in chunk]
-        predictions = pipeline.predict_batch(texts, compute_posterior=not fast)
+        predictions = pipeline.predict_batch(
+            texts, compute_posterior=not fast, segmentation=segmentation)
         for row, prediction in zip(chunk, predictions):
             text, gold_parts, reliable = _gold_parts(row)
             hypothesis_parts = _hypothesis_parts(text, prediction)
@@ -369,6 +371,8 @@ def evaluate_rows(pipeline: V4Pipeline, rows: Iterable[dict[str, Any]], *,
         result["sentence_exact_exempt"] = (
             totals["sentence_exact_exempt"] / max(1, totals["sentences"]))
         result["exempt_positions_applied"] = totals["exempt_positions_applied"]
+    if segmentation is not None:
+        result["segmentation"] = segmentation
     return result
 
 def _count_rows(path: str) -> int:
@@ -405,6 +409,11 @@ def main() -> None:
                         help="force using legacy discrete providers instead of unified lexicon pack")
     parser.add_argument("--no-tqdm", action="store_true",
                         help="disable tqdm progress bar")
+    parser.add_argument("--segmentation", default=None,
+                        choices=("free", "unidic", "pyopenjtalk", "chars"),
+                        help="word-boundary policy: 'free' keeps joint "
+                             "segmentation+reading Viterbi; others freeze "
+                             "boundaries to that tokenizer")
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
@@ -415,7 +424,8 @@ def main() -> None:
         unidic_dir=args.unidic,
         unified_lexicon_path=args.unified_lexicon,
         use_legacy_lexicon_only=args.use_legacy_lexicon_only,
-        strict_resources=not args.allow_resource_mismatch)
+        strict_resources=not args.allow_resource_mismatch,
+        segmentation=args.segmentation)
     if args.generator_inference:
         pipeline.config["generator_inference"] = True
         pipeline.config["generator_ready"] = True
@@ -446,7 +456,8 @@ def main() -> None:
 
     result = evaluate_rows(pipeline, counting(progress),
                            batch_size=args.batch_size, limit=args.limit,
-                           fast=args.fast, exempt=_load_exempt(args.exempt))
+                           fast=args.fast, exempt=_load_exempt(args.exempt),
+                           segmentation=args.segmentation)
     if pbar is not None:
         pbar.close()
     rendered = json.dumps(result, ensure_ascii=False, indent=2)

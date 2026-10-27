@@ -69,6 +69,23 @@ print(result["confidence"])
 `predict` returns the reading, the chosen candidate edges (with per-edge
 source and lock state), a path score, and a confidence value.
 
+### Fixed word boundaries
+
+By default the model decides segmentation jointly with the readings. To pin
+boundaries to a tokenizer (or to caller-provided spans) and let the model
+choose only the readings inside them:
+
+```python
+result = pipeline.predict("東京都に行った。", segmentation="unidic")
+for unit in result["segmentation"]["segments"]:
+    print(unit["surface"], unit["reading"])
+```
+
+`segmentation="free"` keeps the joint behaviour; `"unidic"`, `"pyopenjtalk"`
+and `"chars"` freeze boundaries, and `segments=[...]` accepts surfaces or
+`(start, end)` pairs. Training can match this with `train_segmentation` and
+`inference_segmentation` in the config.
+
 ## Training
 
 Training is config-driven (`python -m kashi_g2p.train --config your_config.yaml`);

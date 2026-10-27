@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .normalization import hira
+from .segmentation import make_tagger
 
 
 @dataclass(frozen=True)
@@ -170,8 +171,7 @@ class LatticeBuilder:
         tagger = None
         if unidic_dir:
             try:
-                import fugashi
-                tagger = fugashi.Tagger(f'-r nul -d "{unidic_dir}"')
+                tagger = make_tagger(unidic_dir)
             except Exception:
                 tagger = None
         result = cls(lex, corpus=corpus, tagger=tagger, node_cap=node_cap)
@@ -196,8 +196,7 @@ class LatticeBuilder:
         self.tagger = None
         if self.unidic_dir:
             try:
-                import fugashi
-                self.tagger = fugashi.Tagger(f'-r nul -d "{self.unidic_dir}"')
+                self.tagger = make_tagger(self.unidic_dir)
             except Exception:
                 self.tagger = None
         self.last_overflow = False

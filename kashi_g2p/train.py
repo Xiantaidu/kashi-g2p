@@ -35,6 +35,7 @@ from .data import (SparseEdgeCollator, auxiliary_losses, build_loader,
 from .decoder import (allowed_edge_mask, batched_partial_path_nll,
                       decode_viterbi)
 from .model import SpanG2P, parameter_count
+from .segmentation import DeferredSegmenter
 from .v5_model import SpanG2Pv5, kana_token_ids
 
 
@@ -64,6 +65,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dynamic_reading_length": True,
     "deduplicate_readings": True,
     "lexicon_pack": None,
+    # A unified pack replaces the discrete lexical providers.
+    "unified_lexicon_path": None,
     "use_prior_table": False,
     "prior_dim": 4,
     "yomogi_warm_start": False,
@@ -139,6 +142,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "transition_features": "context",
     "first_order_loss": False,
     "coarsen_segmentation": True,
+    # Restricts the graph to fixed word spans; None keeps free mode.
+    "train_segmentation": None,
+    # Written to the checkpoint for V4Pipeline's default decoding mode.
+    "inference_segmentation": None,
     "transition_lr": None,
     "transition_weight_decay": 0.0,
     "transition_init_std": 0.02,
@@ -259,6 +266,7 @@ def _provider(config: dict[str, Any], *, memory: bool) -> CompositeProvider:
         kanjidic_path=config.get("kanjidic"),
         jmdict_path=config.get("jmdict"),
         unidic_dir=config.get("unidic"),
+        unified_lexicon_path=config.get("unified_lexicon_path"),
         lyric_train=(config.get("data") if memory and config.get("use_lyric_memory") else None),
         include_okurigana=True,
         use_haqumei=bool(config.get("use_haqumei", True)),
@@ -726,8 +734,18 @@ def run(config: dict[str, Any]) -> dict[str, float | int]:
     manifest = (provider.resource_manifest
                 if bool(config.get("resource_manifest", True)) else {})
     eval_provider = provider
-    print(json.dumps({"status": "candidate_resources_ready"},
-                     ensure_ascii=False), flush=True)
+    segmenter = DeferredSegmenter(
+        config.get("train_segmentation"),
+        unidic_dir=config.get("unidic"))
+    if config.get("train_segmentation"):
+        print(json.dumps({"status": "candidate_resources_ready",
+                          "train_segmentation": (
+                              getattr(segmenter, "name", None)
+                              if segmenter is not None else "free")},
+                         ensure_ascii=False), flush=True)
+    else:
+        print(json.dumps({"status": "candidate_resources_ready"},
+                         ensure_ascii=False), flush=True)
     collator = SparseEdgeCollator(
         provider, vocab, int(config["max_reading_length"]), inject_gold=False,
         gold_injection_prob=float(config.get("gold_injection_prob", 0.0)),
@@ -735,7 +753,8 @@ def run(config: dict[str, Any]) -> dict[str, float | int]:
         deduplicate_readings=bool(config.get("deduplicate_readings", True)),
         ids=ids, max_span_length=int(config.get("max_span_length", 16)),
         coarsen_segmentation=bool(config.get("coarsen_segmentation", True)),
-        contrast_mode=str(config.get("contrast_mode", "all")))
+        contrast_mode=str(config.get("contrast_mode", "all")),
+        segmentation=segmenter)
     # Eval never injects gold, but in hard mode the trusted mask must be built
     # so model_kwargs wiring matches training; the model itself skips
     # L_contrast under model.eval()/no-grad, so eval needs no contrast loss.
@@ -746,7 +765,8 @@ def run(config: dict[str, Any]) -> dict[str, float | int]:
         deduplicate_readings=bool(config.get("deduplicate_readings", True)),
         ids=ids, max_span_length=int(config.get("max_span_length", 16)),
         coarsen_segmentation=False,
-        contrast_mode=str(config.get("contrast_mode", "all")))
+        contrast_mode=str(config.get("contrast_mode", "all")),
+        segmentation=segmenter)
     bucket_buffer_size = int(config.get("bucket_buffer_size", 0))
     length_buckets = config.get("length_buckets")
     train_loader = build_loader(
