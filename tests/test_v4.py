@@ -1234,3 +1234,97 @@ def test_unified_lexicon_provider():
 
 
 
+
+
+class _FixedSpans:
+    """Minimal segmenter stub: fixed spans, no tokenizer dependency."""
+
+    name = "test"
+
+    def __init__(self, spans):
+        self.spans = list(spans)
+
+    def segment(self, _text):
+        from kashi_g2p.segmentation import Segment
+        return [Segment(start, end, "") for start, end in self.spans]
+
+
+def test_fixed_segments_filter_gold_before_coarsening():
+    """Coarsening before the boundary filter clears the only path that the
+    filtered graph still offers, so the row loses its path loss entirely."""
+    row = {
+        "text": "一刻",
+        "B": ["いっ", "こく"],
+        "C": [0, 0],
+        "D": ["無", "無"],
+        "loss_mask": [1, 1],
+    }
+    edges = [Edge(0, 2, "一刻", "いっこく", "jmdict", prior=1.0, confidence=0.9),
+             Edge(0, 1, "一", "いっ", "kanjidic"),
+             Edge(1, 2, "刻", "こく", "kanjidic")]
+    segmenter = _FixedSpans([(0, 1), (1, 2)])
+
+    from kashi_g2p.data import _contained_indices
+    kept = _contained_indices([(e.start, e.end) for e in edges],
+                              segmenter.spans, 2)
+    restricted = [edges[i] for i in kept]
+    result, mask = build_gold_edges(row, restricted, coarsen_segmentation=True)
+    assert gold_constraint_reachable(result, mask, 2)
+
+
+def test_crossing_special_span_is_dropped_not_left_unreachable():
+    """A 熟字訓 span covering two fixed words cannot be expressed inside the
+    restricted graph; it must be dropped so the row stays supervised."""
+    from kashi_g2p.data import _isolate_crossing_specials
+    row = {
+        "text": "大学生",
+        "B": ["だいがくせい", "COPY", "COPY"],
+        "C": [0, 0, 0],
+        "D": ["無", "無", "無"],
+        "loss_mask": [1, 0, 0],
+        "special_spans": [{"start": 0, "end": 3, "reading": "だいがくせい"}],
+    }
+    patched, dropped = _isolate_crossing_specials(row, [(0, 2), (2, 3)])
+    assert dropped == [(0, 3, "だいがくせい")]
+    assert patched["special_spans"] == []
+    assert patched["loss_mask"] == [0, 0, 0]
+    assert patched["B"][0] == "COPY"
+
+    inside = dict(row, special_spans=[
+        {"start": 0, "end": 2, "reading": "だいがく"}])
+    kept_row, kept_dropped = _isolate_crossing_specials(inside, [(0, 2), (2, 3)])
+    assert kept_dropped == []
+    assert kept_row["special_spans"][0]["reading"] == "だいがく"
+
+
+def test_released_lexicon_bundle_is_readable_by_training(tmp_path):
+    """The published lexicon.txz must load without the legacy gzip pickles."""
+    import lzma
+
+    from kashi_g2p.bundle import is_bundle, read_bundle
+    from kashi_g2p.lexicon_pack import build_prior_index
+
+    body = "\n".join([
+        "##kashi-g2p v1",
+        "##section pack",
+        "大学\tだいがく\tunidic\t1.0\t1.0",
+        "大学\tだいがくせい\tunidic\t0.5\t0.9",
+        "##section prior",
+        "大学\tだいがく\t1",
+        "大学\tだいがくせい\t2",
+        "##section vocab",
+        "大",
+        "学",
+        "##end",
+    ]) + "\n"
+    path = tmp_path / "lexicon.txz"
+    path.write_bytes(lzma.compress(body.encode("utf-8")))
+
+    assert is_bundle(path)
+    pack, prior, components, vocab = read_bundle(path)
+    assert pack["大学"] == (("だいがく", "unidic", 1.0, 1.0),
+                            ("だいがくせい", "unidic", 0.5, 0.9))
+    assert components == {}
+    assert vocab == ["大", "学"]
+    assert list(build_prior_index(path).items()) == [
+        (("大学", "だいがく"), 1), (("大学", "だいがくせい"), 2)]

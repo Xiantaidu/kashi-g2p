@@ -738,6 +738,9 @@ def run(config: dict[str, Any]) -> dict[str, float | int]:
         config.get("train_segmentation"),
         unidic_dir=config.get("unidic"))
     if config.get("train_segmentation"):
+        # Resolve eagerly: a bad dictionary path must abort the run rather
+        # than silently training on an unrestricted graph.
+        segmenter.segment("日本語")
         print(json.dumps({"status": "candidate_resources_ready",
                           "train_segmentation": (
                               getattr(segmenter, "name", None)

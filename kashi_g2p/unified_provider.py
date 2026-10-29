@@ -57,8 +57,13 @@ class UnifiedLexiconProvider(CandidateProvider):
         path = Path(pack_path)
         if not path.exists():
             raise FileNotFoundError(f"Unified lexicon pack not found: {path}")
-        with gzip.open(path, "rb") as f:
-            table = pickle.load(f)
+        from .bundle import is_bundle, read_bundle
+
+        if is_bundle(path):
+            table = read_bundle(path)[0]
+        else:
+            with gzip.open(path, "rb") as f:
+                table = pickle.load(f)
         return cls(table, **kwargs)
 
     def build(self, text: str) -> list[Edge]:

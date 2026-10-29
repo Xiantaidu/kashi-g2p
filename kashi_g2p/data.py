@@ -391,6 +391,7 @@ def _safe_token_ids(text: str, vocab: dict[str, int]) -> list[int]:
 
 
 _SEGMENTATION_FALLBACKS = [0]
+_SEGMENTATION_FAILED_ONCE = [False]
 
 
 def _segment_contained_edges(edges: Sequence[Edge], segmenter,
@@ -408,17 +409,69 @@ def _segment_contained_edges(edges: Sequence[Edge], segmenter,
                 "error": f"{type(exc).__name__}: {exc}"[:200],
             }, ensure_ascii=False), flush=True)
         return None
-    segment_end = [0] * len(text)
+    return _contained_indices(
+        [(edge.start, edge.end) for edge in edges], spans, len(text))
+
+
+def _contained_indices(edge_spans: Sequence[tuple[int, int]],
+                       spans: Sequence[tuple[int, int]],
+                       length: int) -> list[int]:
+    segment_end = [0] * length
     for start, end in spans:
-        for position in range(max(0, start), min(len(text), end)):
+        for position in range(max(0, start), min(length, end)):
             segment_end[position] = end
     kept: list[int] = []
-    for index, edge in enumerate(edges):
-        if (0 <= edge.start < len(text)
-                and edge.end <= segment_end[edge.start]
-                and segment_end[edge.start] > 0):
+    for index, (start, end) in enumerate(edge_spans):
+        if (0 <= start < length and end <= segment_end[start]
+                and segment_end[start] > 0):
             kept.append(index)
     return kept
+
+
+def _isolate_crossing_specials(
+        row: dict, spans: Sequence[tuple[int, int]]
+        ) -> tuple[dict, list[tuple[int, int, str]]]:
+    """Move special spans that straddle a fixed boundary out of the gold set.
+
+    A 熟字訓 span such as 大学生->だいがくせい is one word for the lexicon but
+    two UniDic segments, so no edge inside the restricted graph can carry it.
+    Keeping it leaves the gold path unreachable and the row contributes no
+    path loss. Drop those spans and neutralise their anchor exactly as the
+    window-cut path does, so the remaining characters stay supervised.
+    """
+    text_length = len(row.get("text", ""))
+    specials = _special_spans(row, text_length)
+    if not specials:
+        return row, []
+    segment_end = [0] * text_length
+    for start, end in spans:
+        for position in range(max(0, start), min(text_length, end)):
+            segment_end[position] = end
+    inside: list[dict] = []
+    dropped: list[tuple[int, int, str]] = []
+    for start, end, reading in specials:
+        if (0 <= start < text_length and segment_end[start] != 0
+                and end <= segment_end[start]):
+            inside.append({"start": start, "end": end, "reading": reading,
+                           "type": "熟字訓"})
+        else:
+            dropped.append((start, end, reading))
+    if not dropped:
+        return row, []
+    patched = dict(row)
+    patched["special_spans"] = inside
+    loss_mask = list(patched.get("loss_mask") or [])
+    row_b = list(patched.get("B") or [])
+    for start, end, _reading in dropped:
+        for position in range(start, min(end, len(loss_mask))):
+            loss_mask[position] = 0
+        if start < len(row_b):
+            row_b[start] = "COPY"
+    if loss_mask:
+        patched["loss_mask"] = loss_mask
+    if row_b:
+        patched["B"] = row_b
+    return patched, dropped
 
 
 @dataclass
@@ -464,6 +517,25 @@ class SparseEdgeCollator:
         digest = int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
         return (digest % 1_000_000) < int(self.gold_injection_prob * 1_000_000)
 
+    @staticmethod
+    def _segment_spans(segmenter, text: str) -> list[tuple[int, int]] | None:
+        """Fixed-word spans, or None when segmentation is unavailable."""
+        try:
+            return [(int(segment.start), int(segment.end))
+                    for segment in segmenter.segment(text)]
+        except Exception as exc:  # noqa: BLE001 - misaligned tokenizer output
+            _SEGMENTATION_FALLBACKS[0] += 1
+            if (_SEGMENTATION_FALLBACKS[0] % 500 == 1
+                    or not _SEGMENTATION_FAILED_ONCE[0]):
+                _SEGMENTATION_FAILED_ONCE[0] = True
+                print(json.dumps({
+                    "event": "segmentation_unavailable",
+                    "occurrences": _SEGMENTATION_FALLBACKS[0],
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                    "effect": "fixed-boundary filtering DISABLED for this run",
+                }, ensure_ascii=False), flush=True)
+            return None
+
     def __call__(self, rows: list[dict]) -> EdgeBatch:
         if not rows:
             raise ValueError("empty batch")
@@ -489,15 +561,22 @@ class SparseEdgeCollator:
         specials_by_row: list[list[tuple[int, int, str]]] = []
         for row, text in zip(rows, texts):
             should_inject = self._should_inject(text)
-            edges, compatible = build_gold_edges(
-                row, self.provider.build(text), inject_missing=should_inject,
-                coarsen_segmentation=self.coarsen_segmentation)
+            natural = self.provider.build(text)
+            spans: list[tuple[int, int]] | None = None
             if self.segmentation is not None:
-                kept = _segment_contained_edges(
-                    edges, self.segmentation, text)
-                if kept is not None:
-                    compatible = [compatible[i] for i in kept]
-                    edges = [edges[i] for i in kept]
+                spans = self._segment_spans(self.segmentation, text)
+                if spans is not None:
+                    # Restrict first: supervision built on a cross-boundary
+                    # edge cannot survive the filter, and dropping it after
+                    # the fact leaves gold_reachable=False.
+                    kept = _contained_indices(
+                        [(edge.start, edge.end) for edge in natural],
+                        spans, len(text))
+                    natural = [natural[i] for i in kept]
+                    row = _isolate_crossing_specials(row, spans)[0]
+            edges, compatible = build_gold_edges(
+                row, natural, inject_missing=should_inject,
+                coarsen_segmentation=self.coarsen_segmentation)
             all_edges.append(edges)
             all_masks.append(compatible)
             specials_by_row.append(_special_spans(row, len(text)))

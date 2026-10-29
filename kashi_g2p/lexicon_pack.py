@@ -101,7 +101,16 @@ def build_prior_index(pack_path: str | Path) -> "OrderedDict[tuple[str, str], in
 
     Id 0 is reserved for edges that do not exist in the pack (COPY, rules,
     neural proposals), which the model embeds as its own learned row.
+    Accepts the LEX1 pack or a released ``lexicon.txz`` bundle; the bundle
+    records its own ids, which are replayed in order so a checkpoint's prior
+    rows stay aligned.
     """
+    from .bundle import is_bundle, read_bundle
+
+    if is_bundle(pack_path):
+        prior = read_bundle(pack_path)[1]
+        return OrderedDict(sorted(prior.items(), key=lambda item: item[1]))
+
     pack = LexiconPack(pack_path)
     index: "OrderedDict[tuple[str, str], int]" = OrderedDict()
     next_id = 1
