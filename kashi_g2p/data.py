@@ -429,7 +429,7 @@ def _contained_indices(edge_spans: Sequence[tuple[int, int]],
 
 
 def _isolate_crossing_specials(
-        row: dict, spans: Sequence[tuple[int, int]]
+        row: dict, spans: Sequence[tuple[int, int]], text_length: int
         ) -> tuple[dict, list[tuple[int, int, str]]]:
     """Move special spans that straddle a fixed boundary out of the gold set.
 
@@ -439,7 +439,6 @@ def _isolate_crossing_specials(
     path loss. Drop those spans and neutralise their anchor exactly as the
     window-cut path does, so the remaining characters stay supervised.
     """
-    text_length = len(row.get("text", ""))
     specials = _special_spans(row, text_length)
     if not specials:
         return row, []
@@ -448,16 +447,22 @@ def _isolate_crossing_specials(
         for position in range(max(0, start), min(text_length, end)):
             segment_end[position] = end
     inside: list[dict] = []
+    kept_offsets: set[tuple[int, int]] = set()
     dropped: list[tuple[int, int, str]] = []
     for start, end, reading in specials:
         if (0 <= start < text_length and segment_end[start] != 0
                 and end <= segment_end[start]):
-            inside.append({"start": start, "end": end, "reading": reading,
-                           "type": "熟字訓"})
+            inside.append({"start": start, "end": end, "reading": reading})
+            kept_offsets.add((start, end))
         else:
             dropped.append((start, end, reading))
     if not dropped:
         return row, []
+    # Keep any span metadata the loader does not use (e.g. "type").
+    originals = {(int(s.get("start", -1)), int(s.get("end", -1))): s
+                 for s in (row.get("special_spans") or [])
+                 if isinstance(s, dict)}
+    inside = [dict(originals.get((s["start"], s["end"]), s)) for s in inside]
     patched = dict(row)
     patched["special_spans"] = inside
     loss_mask = list(patched.get("loss_mask") or [])
@@ -573,7 +578,8 @@ class SparseEdgeCollator:
                         [(edge.start, edge.end) for edge in natural],
                         spans, len(text))
                     natural = [natural[i] for i in kept]
-                    row = _isolate_crossing_specials(row, spans)[0]
+                    row = _isolate_crossing_specials(
+                        row, spans, len(text))[0]
             edges, compatible = build_gold_edges(
                 row, natural, inject_missing=should_inject,
                 coarsen_segmentation=self.coarsen_segmentation)

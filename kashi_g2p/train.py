@@ -112,6 +112,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "d_ff": 1280,
     "edge_dim": 256,
     "component_dim": 256,
+    # IDS component channel. False drops the embedding/projection entirely.
+    "use_components": True,
     "fusion_layers": [2, 4, 6, 8],
     "fusion_heads": 8,
     "max_span_length": 16,
@@ -903,6 +905,7 @@ def run(config: dict[str, Any]) -> dict[str, float | int]:
             max_seq_len=int(config["max_seq_len"]),
             max_reading_len=int(config["max_reading_length"]),
             component_dim=int(config.get("component_dim", 256)),
+            use_components=bool(config.get("use_components", True)),
             source_count=int(config["source_count"]), edge_dim=int(config["edge_dim"]),
             dropout=float(config["dropout"]),
             reading_kernel_size=int(config["reading_kernel_size"]),

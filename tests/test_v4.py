@@ -1284,7 +1284,7 @@ def test_crossing_special_span_is_dropped_not_left_unreachable():
         "loss_mask": [1, 0, 0],
         "special_spans": [{"start": 0, "end": 3, "reading": "だいがくせい"}],
     }
-    patched, dropped = _isolate_crossing_specials(row, [(0, 2), (2, 3)])
+    patched, dropped = _isolate_crossing_specials(row, [(0, 2), (2, 3)], 3)
     assert dropped == [(0, 3, "だいがくせい")]
     assert patched["special_spans"] == []
     assert patched["loss_mask"] == [0, 0, 0]
@@ -1292,7 +1292,7 @@ def test_crossing_special_span_is_dropped_not_left_unreachable():
 
     inside = dict(row, special_spans=[
         {"start": 0, "end": 2, "reading": "だいがく"}])
-    kept_row, kept_dropped = _isolate_crossing_specials(inside, [(0, 2), (2, 3)])
+    kept_row, kept_dropped = _isolate_crossing_specials(inside, [(0, 2), (2, 3)], 3)
     assert kept_dropped == []
     assert kept_row["special_spans"][0]["reading"] == "だいがく"
 
@@ -1328,3 +1328,38 @@ def test_released_lexicon_bundle_is_readable_by_training(tmp_path):
     assert vocab == ["大", "学"]
     assert list(build_prior_index(path).items()) == [
         (("大学", "だいがく"), 1), (("大学", "だいがくせい"), 2)]
+
+
+def test_use_components_false_removes_the_channel_entirely():
+    """`ids`-less training must drop the module, not just zero-fill it."""
+    kw = dict(vocab_size=64, layers=1, dim=32, heads=4, d_ff=64, max_seq_len=16,
+              max_reading_len=8, component_dim=8, source_count=4, edge_dim=16,
+              dropout=0.0, fusion_layers=(1,), fusion_heads=4,
+              max_span_length=4, use_open_generator=False,
+              use_transition_head=False, activation_checkpointing=False,
+              reading_kernel_size=3)
+    torch.manual_seed(0)
+    on = SpanG2P(**kw)
+    off = SpanG2P(use_components=False, **kw)
+
+    assert on.component_embed is not None and off.component_embed is None
+    assert on.component_proj is not None and off.component_proj is None
+    assert not [k for k in off.state_dict() if k.startswith("component_")]
+    removed = sum(p.numel() for p in on.parameters()) - \
+        sum(p.numel() for p in off.parameters())
+    assert removed == 1024 * 0 + 1024 * 8 + 8 * 32  # embed(1024x8)+proj(8x32)
+
+    tokens = torch.randint(0, 64, (2, 6))
+    char_types = torch.zeros((2, 6), dtype=torch.long)
+    zeros = torch.zeros((2, 6, 4), dtype=torch.long)
+    shared = {k: v for k, v in on.state_dict().items()
+              if not k.startswith("component_")}
+    off.load_state_dict(shared, strict=True)
+    on.component_embed.weight.data.zero_()
+    on.component_proj.weight.data.zero_()
+    with torch.no_grad():
+        zeroed_channel = on._input_embedding(tokens, zeros, char_types)
+        no_channel = off._input_embedding(tokens, None, char_types)
+        no_channel_with_tensor = off._input_embedding(tokens, zeros, char_types)
+    assert torch.equal(zeroed_channel, no_channel)
+    assert torch.equal(zeroed_channel, no_channel_with_tensor)

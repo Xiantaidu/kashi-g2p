@@ -213,6 +213,10 @@ def _model_config(config: Mapping[str, Any], state: Mapping[str, Tensor]) -> dic
     if component is not None and "component_vocab_size" in allowed:
         result["component_vocab_size"] = int(component.shape[0])
         result["component_dim"] = int(component.shape[1])
+    # A checkpoint without component weights was trained with the channel off;
+    # constructing the module anyway would add a randomly initialised branch.
+    if "use_components" in allowed:
+        result["use_components"] = component is not None
     char_type = state.get("char_type_embed.weight")
     if char_type is not None:
         result["char_type_count"] = int(char_type.shape[0])

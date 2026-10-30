@@ -368,6 +368,7 @@ class SpanG2P(nn.Module):
                  dim: int = 512, heads: int = 8, d_ff: int = 1280,
                  max_seq_len: int = 256, max_reading_len: int = 64,
                  component_vocab_size: int = 1024, component_dim: int = 256,
+                 use_components: bool = True,
                  char_type_count: int = 7, source_count: int = 16,
                  source_dim: int = 32, edge_dim: int = 256,
                  dropout: float = 0.1, reading_kernel_size: int = 5,
@@ -413,9 +414,18 @@ class SpanG2P(nn.Module):
         # state_dict keys are unchanged.
         self.profile_ranges = False
         self.char_embed = nn.Embedding(vocab_size, dim, padding_idx=self.pad_id)
-        self.component_embed = nn.Embedding(
-            component_vocab_size, component_dim, padding_idx=0)
-        self.component_proj = nn.Linear(component_dim, dim, bias=False)
+        # IDS components are an optional input channel. With use_components
+        # False the embedding and projection are never created, so the
+        # parameters, their optimizer state, and the ONNX runtime's zero-filled
+        # component tensor all disappear rather than lingering as dead weights.
+        self.use_components = bool(use_components)
+        if self.use_components:
+            self.component_embed = nn.Embedding(
+                component_vocab_size, component_dim, padding_idx=0)
+            self.component_proj = nn.Linear(component_dim, dim, bias=False)
+        else:
+            self.component_embed = None
+            self.component_proj = None
         self.char_type_embed = nn.Embedding(char_type_count, dim)
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
@@ -503,12 +513,16 @@ class SpanG2P(nn.Module):
                 nn.init.zeros_(self.transition_head.reading_right_proj.weight)
 
     def _initialize(self, reading_kernel_size: int) -> None:
-        for embedding in (self.char_embed, self.component_embed,
-                          self.char_type_embed, self.reading_pos, self.source_embed):
+        embeddings = [self.char_embed, self.char_type_embed, self.reading_pos,
+                      self.source_embed]
+        if self.component_embed is not None:
+            embeddings.append(self.component_embed)
+        for embedding in embeddings:
             nn.init.normal_(embedding.weight, mean=0.0, std=0.02)
         with torch.no_grad():
             self.char_embed.weight[self.pad_id].zero_()
-            self.component_embed.weight[self.pad_id].zero_()
+            if self.component_embed is not None:
+                self.component_embed.weight[self.pad_id].zero_()
             self.reading_conv.weight.zero_()
             self.reading_conv.weight[:, 0, reading_kernel_size // 2] = 1.0
         scale = (2.0 * max(1, len(self.blocks))) ** -0.5
@@ -629,7 +643,7 @@ class SpanG2P(nn.Module):
                          component_ids: Tensor | None,
                          char_type_ids: Tensor | None) -> Tensor:
         hidden = self.char_embed(input_ids)
-        if component_ids is not None:
+        if component_ids is not None and self.component_embed is not None:
             components = self.component_embed(component_ids).sum(-2)
             hidden = hidden + self.component_proj(components)
         if char_type_ids is not None:
