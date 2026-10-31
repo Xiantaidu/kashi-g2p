@@ -1,9 +1,7 @@
-"""Reader for the released ``lexicon.txz`` deployment bundle.
+"""Reader for the ``lexicon.txz`` resource bundle.
 
-The bundle is the single artifact the ONNX converter downloads; training
-used to require the three intermediate gzip pickles instead, so a released
-checkpoint could not be reproduced from published files. This module lets the
-training-side provider read the bundle directly.
+Lets the training-side provider read the same single-file bundle the
+converter uses.
 """
 
 from __future__ import annotations
@@ -28,9 +26,7 @@ def is_bundle(path: str | Path) -> bool:
 def read_bundle(path: str | Path):
     """Return ``(pack, prior, components, vocab)`` from a lexicon bundle.
 
-    ``pack`` maps surface -> tuple of ``(reading, source, prior, confidence)``
-    in the order the builder emitted them, matching the legacy pickle layout
-    exactly so the provider sees identical candidates.
+    ``pack`` maps surface -> tuple of ``(reading, source, prior, confidence)``.
     """
     path = Path(path)
     with lzma.open(path, "rb") as handle:

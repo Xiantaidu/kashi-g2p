@@ -1298,7 +1298,7 @@ def test_crossing_special_span_is_dropped_not_left_unreachable():
 
 
 def test_released_lexicon_bundle_is_readable_by_training(tmp_path):
-    """The published lexicon.txz must load without the legacy gzip pickles."""
+    """The lexicon bundle loads without the legacy pickle resources."""
     import lzma
 
     from kashi_g2p.bundle import is_bundle, read_bundle

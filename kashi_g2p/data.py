@@ -433,11 +433,8 @@ def _isolate_crossing_specials(
         ) -> tuple[dict, list[tuple[int, int, str]]]:
     """Move special spans that straddle a fixed boundary out of the gold set.
 
-    A 熟字訓 span such as 大学生->だいがくせい is one word for the lexicon but
-    two UniDic segments, so no edge inside the restricted graph can carry it.
-    Keeping it leaves the gold path unreachable and the row contributes no
-    path loss. Drop those spans and neutralise their anchor exactly as the
-    window-cut path does, so the remaining characters stay supervised.
+    Their anchor is neutralised like the window-cut path, so the remaining
+    characters stay supervised.
     """
     specials = _special_spans(row, text_length)
     if not specials:
@@ -572,8 +569,7 @@ class SparseEdgeCollator:
                 spans = self._segment_spans(self.segmentation, text)
                 if spans is not None:
                     # Restrict first: supervision built on a cross-boundary
-                    # edge cannot survive the filter, and dropping it after
-                    # the fact leaves gold_reachable=False.
+                    # edge cannot survive the filter.
                     kept = _contained_indices(
                         [(edge.start, edge.end) for edge in natural],
                         spans, len(text))

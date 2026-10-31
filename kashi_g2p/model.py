@@ -414,10 +414,8 @@ class SpanG2P(nn.Module):
         # state_dict keys are unchanged.
         self.profile_ranges = False
         self.char_embed = nn.Embedding(vocab_size, dim, padding_idx=self.pad_id)
-        # IDS components are an optional input channel. With use_components
-        # False the embedding and projection are never created, so the
-        # parameters, their optimizer state, and the ONNX runtime's zero-filled
-        # component tensor all disappear rather than lingering as dead weights.
+        # IDS components are an optional input channel; with the channel off
+        # the embedding and projection are never created.
         self.use_components = bool(use_components)
         if self.use_components:
             self.component_embed = nn.Embedding(

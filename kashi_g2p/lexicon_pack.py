@@ -99,11 +99,8 @@ def _decode_front_coded(data: bytes):
 def build_prior_index(pack_path: str | Path) -> "OrderedDict[tuple[str, str], int]":
     """Map every (surface, reading) pair in the pack to 1-based ids.
 
-    Id 0 is reserved for edges that do not exist in the pack (COPY, rules,
-    neural proposals), which the model embeds as its own learned row.
-    Accepts the LEX1 pack or a released ``lexicon.txz`` bundle; the bundle
-    records its own ids, which are replayed in order so a checkpoint's prior
-    rows stay aligned.
+    Id 0 is reserved for edges that do not exist in the pack. Accepts the
+    LEX1 pack or a ``lexicon.txz`` bundle, whose ids are replayed in order.
     """
     from .bundle import is_bundle, read_bundle
 
